@@ -229,6 +229,7 @@ Qwen1.5-1.8B-AWQ-INT4
 import logging
 import numpy as np
 import torch
+import tvm
 from PIL import Image
 from vllm import LLM, SamplingParams
 from vllm.config import ModelConfig
@@ -240,6 +241,7 @@ logging.getLogger("vllm").setLevel(logging.WARNING)
 
 model_dir = "./Qwen2.5-VL-7B-Instruct-AWQ-INT4"
 
+
 # 指定多die编译，多die并行计算
 num_die = 4
 # 预填充序列长度
@@ -249,11 +251,13 @@ max_model_len = 4096
 # 模型视觉部分输入size
 input_size = (540, 960, 3)  #(H, W, 3), (1080, 1920, 3), (720, 1280, 3), (540, 960, 3), (448, 768, 3)  (360, 640, 3)
 
+save_dir = f"./Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_{input_size[1]}x{input_size[0]}_{max_model_len}"
+
 torch_edgex.edgex_module.set_trace_only_mode(True)
 torch_edgex.set_device_mode("exec_mode", "AOT")
 torch_edgex.set_device_mode("prefill_lens", [1, prefill_lens])
 # 设置输出目录
-torch_edgex.set_device_mode("AOT_DIR", f"./Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_{input_size[1]}x{input_size[0]}_{max_model_len}")
+torch_edgex.set_device_mode("AOT_DIR", save_dir)
 # 设置多die序列，其中首位表示die0表示主die
 torch_edgex.set_device_mode("die_remap", [0, 1, 2, 3])
 
@@ -304,11 +308,25 @@ def main():
 
     _ = llm.generate(inputs, use_tqdm=False)
 
+    # generate rope param
+    save_func = tvm.get_global_func("runtime.SaveParamsMMap")
+    nd_path = f"{save_dir}/{num_die}die/rope_param.params"
+    param_nd = np.zeros((max_model_len, 2, 64), dtype=np.float16)
+    generate = {}
+    generate["rope_param"] = tvm.nd.array(param_nd)
+    save_func(generate, nd_path)
+
+
 if __name__ == "__main__":
     main()
 ```
 
-编译后产物目录结构如下：
+> **注意**：
+> 
+> - 编译完成后，``mrope``目录下``so``文件需要手动复制到**上级**目录，并重命名为``compute_rope_param.so``
+> - 需要手动复制原模型中的``tokenizer.json``文件到模型目录下
+
+**编译后产物目录结构如下**：
 
 ```shell
 Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_960x540_4096/
@@ -337,9 +355,12 @@ Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_960x540_4096/
     │       ├── llm_die3.params
     │       └── llm_die3.so
     ├── buffer_config.json
+    ├── compute_rope_param.so  # 手动复制mrope目录下的so文件
     ├── config.json
     ├── embedding.params
+    ├── rope_param.params
     ├── empty.bin
+    ├── tokenizer.json  # 手动复制原模型中的tokenizer.json
     ├── mrope
     │   ├── 3_4096_[int32].onnx
     │   └── 3_4096_[int32].so
