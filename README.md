@@ -4,6 +4,14 @@
 
 本文记录了``Edge10``大模型工具链``TyLLM``的变更情况。
 
+**20250414/v1.0.8**
+
+- 🚀优化``Qwen2.5-VL-7B`` ``ViT``部分性能
+
+**20250320/v1.0.6**
+
+- 🚀新增支持``Qwen2.5-VL-7B``模型``3Die``编译
+
 **20250305/v0.0.2**
 
 - 🚀新增支持``Qwen2.5-VL-7B``模型``4Die/1Die``编译
@@ -99,18 +107,16 @@ sudo apt install nvidia-container-toolkit
 
 #### 安装TyLLM工具链
 
-以系统版本``Ubuntu 20.04``、工具链``tyllm_${version}.zip``为例说明``TyLLM``工具链的安装方法。实际操作时，请务必将``${version}``替换为实际对应的工具链版本号，比如``tyllm_v0.0.2.zip``
+工具链获取途径如下，请务必将``${version}``替换为实际对应的工具链版本号，比如``v1.0.8``：
 
-工具链获取途径
+```shell
+sudo docker login 113.100.143.90:8091 -u custom -p DE@sz_intellif_2021
+sudo docker pull 113.100.143.90:8091/edgex/tyllm:${version}
+```
 
-- 云天 docker hub
-
-    ```shell
-    sudo docker login 113.100.143.90:8091 -u custom -p DE@sz_intellif_2021
-    sudo docker pull 113.100.143.90:8091/dengine/tyllm:v0.0.2
-    ```
-
-> **注意**，需要将``113.100.143.90:8091``加入``/etc/docker/daemon.json``中的``insecure-registries``字段中，如下：
+> **注意**
+> 
+> 需要将``113.100.143.90:8091``加入``/etc/docker/daemon.json``中的``insecure-registries``字段中，如下：
 > 
 > ```json
 > {     
@@ -119,22 +125,11 @@ sudo apt install nvidia-container-toolkit
 >  ```
 > 修改后，重启``docker``生效，``sudo systemctl restart docker``
 
-#### 载入Docker Image
-
-```shell
-sudo docker load -i tyllm_v0.0.2.zip
-# 载入成功后，查看镜像
-sudo docker images
-# 输出结果如下
-REPOSITORY                              TAG     IMAGE ID       CREATED         SIZE
-113.100.143.90:8091/dengine/tyllm       v0.0.2  a4a57c8af885   29 hours ago    10.4GB
-```
-
 #### 启动工具链镜像
 
-以下命令创建容器，其中``${your_data_dir}``表示宿主机中用户数据目录。
+以下命令创建容器，其中``${your_data_dir}``表示宿主机中用户数据目录，``${version}``需改为实际版本``tag``。
 ```shell
-docker run --gpus all -v ${your_data_dir}:/data -it 113.100.143.90:8091/dengine/tyllm:v0.0.2 bash
+sudo docker run --gpus all -v ${your_data_dir}:/data -it 113.100.143.90:8091/edgex/tyllm:${version} bash
 ```
 
 ### 模型量化
@@ -209,38 +204,45 @@ build_and_compile_llm(
 **编译后产物目录**：
 
 ```shell
-Qwen1.5-1.8B-AWQ-INT4
-├── added_tokens.json
-├── config.json
-├── generation_config.json
-├── merges.txt
-├── model.safetensors
-├── special_tokens_map.json
-├── tokenizer.json
-├── tokenizer_config.json
-└── vocab.json
+Qwen1.5-1.8B-AWQ-INT4-AOT/
+└── 1die
+    ├── batch_1
+    │   ├── common_die0.params
+    │   ├── seqlen_1
+    │   │   ├── llm_die0.params
+    │   │   └── llm_die0.so
+    │   └── seqlen_8
+    │       ├── llm_die0.params
+    │       └── llm_die0.so
+    ├── buffer_config.json
+    ├── config.json
+    └── empty.bin
 ```
 
 #### 视觉语言大模型
 
-基于``vLLM``的``Qwen2.5-VL``示例：
+基于``vLLM``的``Qwen2.5-VL-7B-Instruct``示例：
 
 ```python
+import os
 import logging
 import numpy as np
 import torch
 import tvm
 from PIL import Image
 from vllm import LLM, SamplingParams
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, ParallelConfig
+from vllm.platforms import current_platform
 from tyllm.vllm_ext.edgex_executor import EdgeXExecutor
 from tyllm import torch_edgex
 
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
+CUR_DEVICE = "cuda" if current_platform.is_cuda() else "cpu"
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
+# 为已经过AutoAWQ量化后的模型路径
 model_dir = "./Qwen2.5-VL-7B-Instruct-AWQ-INT4"
-
 
 # 指定多die编译，多die并行计算
 num_die = 4
@@ -256,18 +258,35 @@ save_dir = f"./Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_{input_size[1]}x{input_size[0
 torch_edgex.edgex_module.set_trace_only_mode(True)
 torch_edgex.set_device_mode("exec_mode", "AOT")
 torch_edgex.set_device_mode("prefill_lens", [1, prefill_lens])
+
 # 设置输出目录
 torch_edgex.set_device_mode("AOT_DIR", save_dir)
-# 设置多die序列，其中首位表示die0表示主die
-torch_edgex.set_device_mode("die_remap", [0, 1, 2, 3])
 
-ModelConfig.verify_with_parallel_config = lambda a, b: True
+# 设置多die序列，其中首位表示die0表示主die
+torch_edgex.set_device_mode("VM_die_remap", [3, 2, 1, 0])
+torch_edgex.set_device_mode("LM_die_remap", [1, 2, 3, 0])
+
 torch._dynamo.reset()
+ModelConfig.verify_with_parallel_config = lambda a, b: True
+origin_post_init = ParallelConfig.__post_init__
+
+
+def modified_post_init(self):
+    origin_post_init(self)
+    self.world_size = 1
+
+
+ParallelConfig.__post_init__ = modified_post_init
+
 
 def main():
     modality = "image"
-    random_image = np.random.randint(0, 256, input_size, dtype=np.uint8)
-    data = Image.fromarray(random_image)
+    if modality == "image":
+        data = Image.fromarray(np.random.randint(0, 256, input_size, dtype=np.uint8))
+    elif modality == "video":
+        num_frames = 10
+        data = np.array([Image.fromarray(np.random.randint(0, 256, input_size, dtype=np.uint8)) for _ in range(num_frames)])
+
     question = "请描述图片中的内容"
 
     llm = LLM(
@@ -324,52 +343,71 @@ if __name__ == "__main__":
 > **注意**：
 > 
 > - 编译完成后，``mrope``目录下``so``文件需要手动复制到**上级**目录，并重命名为``compute_rope_param.so``
+> - 编译完成后，``mrope``目录下``params``文件需要手动复制到**上级**目录，并重命名为``compute_rope_param.params``
+> - 编译完成后，``visual``目录下``*aot_config.json``后缀文件重命名为``aot_config.json``
+> - 编译完成后，``visual``目录下``*buffer_config.json``后缀文件重命名为``buffer_config.json``
+> - 编译完成后，``visual``目录下``*die0.so``后缀文件重命名为``vit_die0.so``
+> - 编译完成后，``visual``目录下``*die1.so``后缀文件重命名为``vit_die1.so``
+> - 编译完成后，``visual``目录下``*die2.so``后缀文件重命名为``vit_die2.so``
+> - 编译完成后，``visual``目录下``*die0.params``后缀文件重命名为``constant_die0.params``
+> - 编译完成后，``visual``目录下``*die1.params``后缀文件重命名为``constant_die1.params``
+> - 编译完成后，``visual``目录下``*die2.params``后缀文件重命名为``constant_die2.params``
 > - 需要手动复制原模型中的``tokenizer.json``文件到模型目录下
 
 **编译后产物目录结构如下**：
 
 ```shell
-Qwen2.5-VL-7B-Instruct-AWQ-INT4-AOT_960x540_4096/
-└── 4die
+Qwen2.5-VL-7B-Instruct-finetune-AWQ-INT4-AOT_960x540_8192/
+├── 4die
     ├── batch_1
-    │   ├── common_die0.params
-    │   ├── common_die1.params
-    │   ├── common_die2.params
-    │   ├── common_die3.params
-    │   ├── seqlen_1
-    │   │   ├── llm_die0.params
-    │   │   ├── llm_die0.so
-    │   │   ├── llm_die1.params
-    │   │   ├── llm_die1.so
-    │   │   ├── llm_die2.params
-    │   │   ├── llm_die2.so
-    │   │   ├── llm_die3.params
-    │   │   └── llm_die3.so
-    │   └── seqlen_96
-    │       ├── llm_die0.params
-    │       ├── llm_die0.so
-    │       ├── llm_die1.params
-    │       ├── llm_die1.so
-    │       ├── llm_die2.params
-    │       ├── llm_die2.so
-    │       ├── llm_die3.params
-    │       └── llm_die3.so
+    │   ├── common_die0.params
+    │   ├── common_die1.params
+    │   ├── common_die2.params
+    │   ├── common_die3.params
+    │   ├── seqlen_1
+    │   │   ├── llm_die0.params
+    │   │   ├── llm_die0.so
+    │   │   ├── llm_die1.params
+    │   │   ├── llm_die1.so
+    │   │   ├── llm_die2.params
+    │   │   ├── llm_die2.so
+    │   │   ├── llm_die3.params
+    │   │   └── llm_die3.so
+    │   └── seqlen_96
+    │       ├── llm_die0.params
+    │       ├── llm_die0.so
+    │       ├── llm_die1.params
+    │       ├── llm_die1.so
+    │       ├── llm_die2.params
+    │       ├── llm_die2.so
+    │       ├── llm_die3.params
+    │       └── llm_die3.so
     ├── buffer_config.json
-    ├── compute_rope_param.so  # 手动复制mrope目录下的so文件
     ├── config.json
     ├── embedding.params
-    ├── rope_param.params
     ├── empty.bin
-    ├── tokenizer.json  # 手动复制原模型中的tokenizer.json
     ├── mrope
-    │   ├── 3_4096_[int32].onnx
-    │   └── 3_4096_[int32].so
+    │   ├── 3_8192_[int32].onnx
+    │   ├── 3_8192_[int32]_aot_config.json
+    │   ├── 3_8192_[int32]_buffer_config.json
+    │   ├── 3_8192_[int32]_die0.params
+    │   ├── 3_8192_[int32]_die0.so
+    │   └── 3_8192_[int32]_graph.json
     └── visual
-        ├── 2584_1176_[float16].onnx
-        ├── 2584_1176_[float16].so
-        └── 2584_1176_[float16]_preset_kwargs.pt
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16].onnx
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_aot_config.json
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_buffer_config.json
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die0.params
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die0.so
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die1.params
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die1.so
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die2.params
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die2.so
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die3.params
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_die3.so
+        ├── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_graph.json
+        └── 2584_1176_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]2584_1_1280_[float16]_preset_kwargs.pt
 ```
-
 
 ## 常见问题
 
