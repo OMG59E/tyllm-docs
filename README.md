@@ -301,10 +301,12 @@ def main():
             "max_pixels": 1280 * 28 * 28,
         },
         disable_mm_preprocessor_cache=True,
+        dtype="float16",
         trust_remote_code=True,
         disable_async_output_proc=True,
         distributed_executor_backend=EdgeXExecutor,
         worker_cls="tyllm.vllm_ext.edgex_executor.EdgeXWorker",
+        device=CUR_DEVICE
     )
 
     if modality == "image":
